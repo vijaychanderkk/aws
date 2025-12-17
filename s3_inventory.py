@@ -2,26 +2,32 @@ import boto3
 import csv
 from datetime import datetime, timedelta
 import sys
+import os
 
-def get_last_access_from_cloudtrail(bucket_name, days_back=90):
+# ====== SSO PROFILE CONFIGURATION ======
+# Set your AWS SSO profile name here
+# To find it, run: aws configure list-profiles
+AWS_PROFILE = os.environ.get('AWS_PROFILE', 'default')  # Reads from environment or uses 'default'
+print(f"Using AWS Profile: {AWS_PROFILE}")
+# ========================================
+
+def get_last_access_from_cloudtrail(bucket_name, days_back=90, session=None):
     """
     Check CloudTrail for last access to bucket
-    Note: CloudTrail must be enabled for this to work
     """
     try:
-        cloudtrail = boto3.client('cloudtrail')
+        cloudtrail = session.client('cloudtrail') if session else boto3.client('cloudtrail')
         
         end_time = datetime.now()
         start_time = end_time - timedelta(days=days_back)
         
-        # Look for any events related to this bucket
         response = cloudtrail.lookup_events(
             LookupAttributes=[
                 {'AttributeKey': 'ResourceName', 'AttributeValue': bucket_name}
             ],
             StartTime=start_time,
             EndTime=end_time,
-            MaxResults=1  # We only need the most recent event
+            MaxResults=1
         )
         
         if response['Events']:
@@ -46,13 +52,12 @@ def get_last_access_from_cloudtrail(bucket_name, days_back=90):
             'days_since_access': 'N/A'
         }
 
-def get_bucket_object_info(bucket_name):
+def get_bucket_object_info(bucket_name, session=None):
     """
-    Alternative method to get bucket size by listing objects
-    More accurate but slower for large buckets
+    Get bucket size by listing objects
     """
     try:
-        s3_client = boto3.client('s3')
+        s3_client = session.client('s3') if session else boto3.client('s3')
         
         total_size = 0
         total_objects = 0
@@ -69,7 +74,6 @@ def get_bucket_object_info(bucket_name):
                     total_size += obj['Size']
                     total_objects += 1
                     
-                    # Track most recent modification
                     if last_modified is None or obj['LastModified'] > last_modified:
                         last_modified = obj['LastModified']
         
@@ -86,21 +90,32 @@ def get_bucket_object_info(bucket_name):
             'last_modified': 'Error'
         }
 
-def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
+def get_s3_bucket_details(profile_name=None, use_cloudwatch=True, check_cloudtrail=True):
     """
     Main function to collect all bucket details
     """
-    s3_client = boto3.client('s3')
+    # Create session with profile
+    if profile_name:
+        session = boto3.Session(profile_name=profile_name)
+        print(f"✓ Connected using profile: {profile_name}\n")
+    else:
+        session = boto3.Session()
+        print(f"✓ Connected using default credentials\n")
+    
+    s3_client = session.client('s3')
     
     buckets_data = []
     
     # Get all buckets
     try:
         buckets = s3_client.list_buckets()['Buckets']
-        print(f"\nFound {len(buckets)} buckets to analyze\n")
+        print(f"Found {len(buckets)} buckets to analyze\n")
     except Exception as e:
-        print(f"Error listing buckets: {e}")
-        print("Make sure you have s3:ListAllMyBuckets permission")
+        print(f"✗ Error listing buckets: {e}")
+        print("\nTroubleshooting:")
+        print("1. Make sure you're logged in: aws sso login --profile", profile_name or "your-profile-name")
+        print("2. Verify profile: aws configure list-profiles")
+        print("3. Test access: aws s3 ls --profile", profile_name or "your-profile-name")
         return []
     
     for idx, bucket in enumerate(buckets, 1):
@@ -108,7 +123,6 @@ def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
         print(f"[{idx}/{len(buckets)}] Processing: {bucket_name}")
         
         try:
-            # Basic bucket info
             bucket_info = {
                 'Bucket Name': bucket_name,
                 'Creation Date': bucket['CreationDate'].strftime('%Y-%m-%d'),
@@ -125,9 +139,8 @@ def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
             # Get bucket size and object count
             if use_cloudwatch:
                 try:
-                    cloudwatch = boto3.client('cloudwatch', region_name=bucket_info['Region'])
+                    cloudwatch = session.client('cloudwatch', region_name=bucket_info['Region'])
                     
-                    # Get bucket size
                     size_response = cloudwatch.get_metric_statistics(
                         Namespace='AWS/S3',
                         MetricName='BucketSizeBytes',
@@ -145,11 +158,9 @@ def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
                         size_bytes = size_response['Datapoints'][0]['Average']
                         bucket_info['Size (GB)'] = round(size_bytes / (1024**3), 4)
                     else:
-                        # Fallback to object listing
-                        obj_info = get_bucket_object_info(bucket_name)
+                        obj_info = get_bucket_object_info(bucket_name, session)
                         bucket_info['Size (GB)'] = obj_info['size_gb']
                     
-                    # Get object count
                     count_response = cloudwatch.get_metric_statistics(
                         Namespace='AWS/S3',
                         MetricName='NumberOfObjects',
@@ -166,17 +177,16 @@ def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
                     if count_response['Datapoints']:
                         bucket_info['Object Count'] = int(count_response['Datapoints'][0]['Average'])
                     else:
-                        obj_info = get_bucket_object_info(bucket_name)
+                        obj_info = get_bucket_object_info(bucket_name, session)
                         bucket_info['Object Count'] = obj_info['object_count']
                         
                 except Exception as e:
                     print(f"  CloudWatch error, using object listing: {e}")
-                    obj_info = get_bucket_object_info(bucket_name)
+                    obj_info = get_bucket_object_info(bucket_name, session)
                     bucket_info['Size (GB)'] = obj_info['size_gb']
                     bucket_info['Object Count'] = obj_info['object_count']
             else:
-                # Use object listing method
-                obj_info = get_bucket_object_info(bucket_name)
+                obj_info = get_bucket_object_info(bucket_name, session)
                 bucket_info['Size (GB)'] = obj_info['size_gb']
                 bucket_info['Object Count'] = obj_info['object_count']
                 bucket_info['Last Object Modified'] = obj_info['last_modified']
@@ -184,12 +194,12 @@ def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
             # Get last access from CloudTrail
             if check_cloudtrail:
                 print(f"  Checking CloudTrail for last access...")
-                access_info = get_last_access_from_cloudtrail(bucket_name)
+                access_info = get_last_access_from_cloudtrail(bucket_name, session=session)
                 bucket_info['Last Access Date'] = access_info['last_access_date']
                 bucket_info['Last Event Type'] = access_info['last_event']
                 bucket_info['Days Since Last Access'] = access_info['days_since_access']
             
-            # Get bucket tags (to identify owner)
+            # Get bucket tags
             try:
                 tags = s3_client.get_bucket_tagging(Bucket=bucket_name)
                 tag_dict = {tag['Key']: tag['Value'] for tag in tags['TagSet']}
@@ -238,15 +248,14 @@ def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
             except:
                 bucket_info['Public Access'] = 'Not Configured'
             
-            # Calculate estimated monthly cost (rough estimate)
+            # Calculate estimated monthly cost
             try:
                 size_gb = float(bucket_info['Size (GB)'])
-                # Standard storage pricing (~$0.023 per GB/month in us-east-1)
                 bucket_info['Est. Monthly Cost ($)'] = round(size_gb * 0.023, 2)
             except:
                 bucket_info['Est. Monthly Cost ($)'] = 0
             
-            # Add recommendation flag
+            # Add recommendation
             days_since = bucket_info.get('Days Since Last Access', 'N/A')
             size_gb = bucket_info.get('Size (GB)', 0)
             
@@ -269,9 +278,6 @@ def get_s3_bucket_details(use_cloudwatch=True, check_cloudtrail=True):
     return buckets_data
 
 def export_to_csv(data, filename='s3_bucket_inventory.csv'):
-    """
-    Export collected data to CSV file
-    """
     if not data:
         print("No data to export")
         return
@@ -288,9 +294,6 @@ def export_to_csv(data, filename='s3_bucket_inventory.csv'):
     print(f"{'='*60}")
 
 def print_summary(data):
-    """
-    Print summary statistics
-    """
     if not data:
         return
     
@@ -314,37 +317,45 @@ def print_summary(data):
 
 if __name__ == "__main__":
     print("="*60)
-    print("AWS S3 Bucket Inventory & Analysis Tool")
+    print("AWS S3 Bucket Inventory & Analysis Tool (SSO Support)")
     print("="*60)
     
-    # Check if user wants to skip CloudTrail (slower)
+    # Get profile from environment variable
+    profile = os.environ.get('AWS_PROFILE')
+    
+    if not profile:
+        print("\n⚠ WARNING: AWS_PROFILE environment variable not set!")
+        print("\nPlease run one of these commands first:")
+        print("  Windows: set AWS_PROFILE=your-profile-name")
+        print("  Mac/Linux: export AWS_PROFILE=your-profile-name")
+        print("\nOr find your profile: aws configure list-profiles")
+        sys.exit(1)
+    
+    # Check if user wants to skip CloudTrail
     check_cloudtrail = True
     if len(sys.argv) > 1 and sys.argv[1] == '--no-cloudtrail':
         check_cloudtrail = False
         print("\nNote: CloudTrail checking disabled (faster but no last access data)")
     
     print("\nStarting S3 bucket inventory...")
-    print("This may take several minutes depending on the number of buckets...\n")
+    print("This may take several minutes...\n")
     
     # Collect data
     bucket_details = get_s3_bucket_details(
+        profile_name=profile,
         use_cloudwatch=True,
         check_cloudtrail=check_cloudtrail
     )
     
     if bucket_details:
-        # Export to CSV
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f's3_inventory_{timestamp}.csv'
         export_to_csv(bucket_details, filename)
-        
-        # Print summary
         print_summary(bucket_details)
         
         print(f"Next steps:")
         print(f"1. Open {filename} in Excel/Sheets")
         print(f"2. Sort by 'Recommendation' column")
         print(f"3. Contact bucket owners for review")
-        print(f"4. Document decisions and take action")
     else:
-        print("\n✗ No data collected. Please check your AWS permissions.")
+        print("\n✗ No data collected. Check troubleshooting steps above.")
